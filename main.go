@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"io"
+
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -9,10 +11,9 @@ import (
 	"syscall"
 )
 
-// usage: sudo ./go-cont run <cmd> <args>
 func main() {
 	if len(os.Args) < 2 {
-		panic("not enough arguments")
+		panic("usage: sudo ./rocker run <cmd> <args>")
 	}
 
 	switch os.Args[1] {
@@ -21,109 +22,128 @@ func main() {
 	case "child":
 		child()
 	default:
-		panic("help")
+		panic("unknown command")
 	}
 }
 
-// run is the Parent process.
-// It sets up the namespaces and invokes the "child" command.
 func run() {
-	fmt.Printf("Running %v as %d\n", os.Args[2:], os.Getpid())
+	fmt.Printf("Parent: Starting container setup %v \n", os.Args[2:])
 
-	// We re-execute this binary with the "child" argument.
-	// This "child" process will be the one running inside the namespaces.
-	args := append([]string{"child"}, os.Args[2:]...)
-	cmd := exec.Command("/proc/self/exe", args...)
+	// --- NEW: Create a Pipe for Synchronization ---
+	// r = read end (passed to child), w = write end (kept by parent)
+	r, w, err := os.Pipe()
+	if err != nil {
+		panic(err)
+	}
 
-	// Connect standard I/O so we can interact with the container
+	cmd := exec.Command("/proc/self/exe", append([]string{"child"}, os.Args[2:]...)...)
+
+	// Pass the Read-End of the pipe to the child as an "ExtraFile"
+	// It will show up as File Descriptor 3 (0=stdin, 1=stdout, 2=stderr, 3=pipe)
+	cmd.ExtraFiles = []*os.File{r}
+
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	// THE MAGIC: Here we define the Namespaces we want to create.
-	// CLONE_NEWUTS: New Hostname Namespace
-	// CLONE_NEWPID: New PID Namespace
-	// CLONE_NEWNS:  New Mount Isolation
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID | syscall.CLONE_NEWNS,
+		Cloneflags:   syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID | syscall.CLONE_NEWNS,
+		Unshareflags: syscall.CLONE_NEWNS,
 	}
 
 	if err := cmd.Start(); err != nil {
-		fmt.Printf("Error starting the run command - %s\n", err)
-		os.Exit(1)
+		panic(err)
 	}
 
+	fmt.Printf("DEBUG: Child Host PID is: %d\n", cmd.Process.Pid)
+
+	// 1. SETUP CGROUPS (Child is currently paused waiting for us)
 	cg(cmd.Process.Pid)
 
+	// 2. SIGNAL CHILD TO RESUME
+	// We write to the pipe. This unblocks the child.
+	fmt.Println("Parent: Cgroup set. Unpausing child...")
+	w.Write([]byte("OK"))
+	w.Close()
+
+	// 3. CLEANUP ON EXIT
+	defer func() {
+		fmt.Println("\nParent: Cleaning up cgroups...")
+		removeCgroup()
+	}()
+
 	if err := cmd.Wait(); err != nil {
-		fmt.Printf("Error waiting for command - %s\n", err)
-		os.Exit(1)
+		fmt.Printf("Parent: Container exited with error: %v\n", err)
 	}
 }
 
-func cg(pid int) {
-	// 1. Determine the correct Cgroup Path
-	// Check if the "pids" controller exists (Cgroup V1)
-	cgroups := "/sys/fs/cgroup"
-	pidsPath := filepath.Join(cgroups, "pids")
-
-	containerCgroup := ""
-
-	if _, err := os.Stat(pidsPath); err == nil {
-		// V1: We must create our cgroup INSIDE the "pids" folder
-		fmt.Println("DEBUG: Detected Cgroup V1")
-		containerCgroup = filepath.Join(pidsPath, "go-cont")
-	} else {
-		// V2: We create it directly in the root
-		fmt.Println("DEBUG: Detected Cgroup V2")
-		containerCgroup = filepath.Join(cgroups, "go-cont")
-	}
-
-	// 2. Create the Directory
-	// If it fails, we panic (unless it just exists)
-	if err := os.Mkdir(containerCgroup, 0755); err != nil && !os.IsExist(err) {
-		panic(fmt.Errorf("failed to create cgroup: %v", err))
-	}
-
-	// 3. Set the Limit (Max 20 Processes)
-	// pids.max is the standard file for both V1 and V2
-	must(os.WriteFile(filepath.Join(containerCgroup, "pids.max"), []byte("20"), 0700))
-
-	// 4. Move Process to Cgroup
-	// cgroup.procs works for both V1 and V2 to add a process
-	must(os.WriteFile(filepath.Join(containerCgroup, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0700))
-}
-
-// child is the process running INSIDE the namespaces.
 func child() {
-	fmt.Printf("Running %v as %d\n", os.Args[2:], os.Getpid())
+	// --- NEW: Wait for Parent Signal ---
+	// File Descriptor 3 is the pipe we passed in cmd.ExtraFiles
+	pipe := os.NewFile(3, "pipe")
 
-	// Set the hostname inside the container
-	syscall.Sethostname([]byte("container"))
+	fmt.Println("Child: Waiting for Cgroup setup...")
 
-	// CHROOT
-	// We hardcode the path for simplicity
-	// In a real implementation, this is dynamic
-	newRoot := "/tmp/container-root"
+	// This READ will block until the parent writes something.
+	// This ensures we don't start the shell until we are jailed.
+	_, err := io.ReadAll(pipe)
+	if err != nil {
+		panic(err)
+	}
+	pipe.Close()
 
+	fmt.Println("Child: Resuming execution!")
+	// -----------------------------------
+
+	must(syscall.Sethostname([]byte("container")))
+
+	// SETUP ROOT FS
+	newRoot := "/tmp/my-container-root"
 	must(syscall.Chroot(newRoot))
 	must(syscall.Chdir("/"))
 
-	// Mount the proc filesystem
-	// source="proc", target="proc", fstype="proc"
+	// MOUNT PROC
+	if err := os.MkdirAll("proc", 0755); err != nil {
+		panic(err)
+	}
 	must(syscall.Mount("proc", "proc", "proc", 0, ""))
+	defer syscall.Unmount("proc", 0)
 
-	// Execute the user's command (e.g., /bin/sh)
-	// We use logic to ensure the command executes properly.
+	// RUN USER COMMAND
 	cmd := exec.Command(os.Args[2], os.Args[3:]...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Run(); err != nil {
-		fmt.Printf("Error running the child command - %s\n", err)
 		os.Exit(1)
 	}
+}
+
+// Keep your existing cg(), removeCgroup(), and must() functions exactly as they were!
+// Copy them from the previous step if you need to.
+// (I am omitting them here to save space, but DO NOT DELETE THEM from your file)
+func cg(pid int) {
+	cgroups := "/sys/fs/cgroup"
+	myGroup := filepath.Join(cgroups, "rocker")
+
+	if err := os.Mkdir(myGroup, 0755); err != nil && !os.IsExist(err) {
+		panic(err)
+	}
+
+	// LIMIT: 10 Processes
+	if err := os.WriteFile(filepath.Join(myGroup, "pids.max"), []byte("10"), 0700); err != nil {
+		fmt.Printf("Warning: Could not set pids.max: %v\n", err)
+	}
+
+	// Add process
+	if err := os.WriteFile(filepath.Join(myGroup, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0700); err != nil {
+		panic(fmt.Sprintf("Failed to add process to cgroup: %v", err))
+	}
+}
+
+func removeCgroup() {
+	os.Remove("/sys/fs/cgroup/rocker")
 }
 
 func must(err error) {
