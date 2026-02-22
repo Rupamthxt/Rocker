@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"io"
-
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,7 +28,7 @@ func main() {
 func run() {
 	fmt.Printf("Parent: Starting container setup %v \n", os.Args[2:])
 
-	// --- NEW: Create a Pipe for Synchronization ---
+	// --- Create a Pipe for Synchronization ---
 	// r = read end (passed to child), w = write end (kept by parent)
 	r, w, err := os.Pipe()
 	if err != nil {
@@ -78,7 +77,7 @@ func run() {
 }
 
 func child() {
-	// --- NEW: Wait for Parent Signal ---
+	// Wait for Parent Signal ---
 	// File Descriptor 3 is the pipe we passed in cmd.ExtraFiles
 	pipe := os.NewFile(3, "pipe")
 
@@ -93,14 +92,39 @@ func child() {
 	pipe.Close()
 
 	fmt.Println("Child: Resuming execution!")
-	// -----------------------------------
 
 	must(syscall.Sethostname([]byte("container")))
 
 	// SETUP ROOT FS
-	newRoot := "/tmp/my-container-root"
-	must(syscall.Chroot(newRoot))
+	newRoot := "/home/rupam/Projects/Rocker/rootfs"
+
+	if _, err := os.Stat(newRoot); os.IsNotExist(err) {
+		fmt.Printf("\n[FATAL] The folder %s is missing!\n", newRoot)
+		fmt.Println("Please run: mkdir -p rootfs && tar -xzf alpine-minirootfs-3.18.4-x86_64.tar.gz -C rootfs/")
+		os.Exit(1)
+	}
+
+	// Make all mounts in this new namespace PRIVATE.
+	// This stops our mounts from leaking to the host and makes pivot_root happy.
+	// source="", target="/", fstype="", flags=MS_PRIVATE|MS_REC
+	must(syscall.Mount("", "/", "", syscall.MS_PRIVATE|syscall.MS_REC, ""))
+
+	// MMount newRoot to itself so that it becomes a distinct mount point.
+	must(syscall.Mount(newRoot, newRoot, "bind", syscall.MS_BIND|syscall.MS_REC, ""))
+
+	putOld := filepath.Join(newRoot, ".put_old")
+	if err := os.MkdirAll(putOld, 0700); err != nil {
+		panic(err)
+	}
+
+	// Swaps the mounts. newRoot becomes "/" and the host "/" moves to ".put_old"
+	must(syscall.PivotRoot(newRoot, putOld))
+	// Change working directory to new root
 	must(syscall.Chdir("/"))
+
+	putOldInsideContainer := "/.put_old"
+	must(syscall.Unmount(putOldInsideContainer, syscall.MNT_DETACH))
+	must(os.Remove(putOldInsideContainer))
 
 	// MOUNT PROC
 	if err := os.MkdirAll("proc", 0755); err != nil {
@@ -120,9 +144,6 @@ func child() {
 	}
 }
 
-// Keep your existing cg(), removeCgroup(), and must() functions exactly as they were!
-// Copy them from the previous step if you need to.
-// (I am omitting them here to save space, but DO NOT DELETE THEM from your file)
 func cg(pid int) {
 	cgroups := "/sys/fs/cgroup"
 	myGroup := filepath.Join(cgroups, "rocker")
