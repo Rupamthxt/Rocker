@@ -41,12 +41,21 @@ wget -nc [https://dl-cdn.alpinelinux.org/alpine/v3.18/releases/x86_64/alpine-min
 tar -xzf alpine-minirootfs-3.18.4-x86_64.tar.gz -C rootfs/
 ```
 
-### 2. Build the Runtime
+### 2. Configure Host Firewall (One-time setup)
+To allow the container to reach the internet, enable IP forwarding and NAT on your host:
+```bash
+sudo sysctl -w net.ipv4.ip_forward=1
+sudo iptables -t nat -A POSTROUTING -s 192.168.100.0/24 -j MASQUERADE
+sudo iptables -A FORWARD -i veth0 -j ACCEPT
+sudo iptables -A FORWARD -o veth0 -j ACCEPT
+```
+
+### 3. Build the Runtime
 ```bash
 go build -o rocker main.go
 ```
 
-### 3. Run a container
+### 4. Run a container
 Launch an interactive shell inside your new isolated environment:
 ```bash
 sudo ./rocker run /bin/sh

@@ -46,7 +46,7 @@ func run() {
 	cmd.Stderr = os.Stderr
 
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags:   syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID | syscall.CLONE_NEWNS,
+		Cloneflags:   syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWNET,
 		Unshareflags: syscall.CLONE_NEWNS,
 	}
 
@@ -56,10 +56,13 @@ func run() {
 
 	fmt.Printf("DEBUG: Child Host PID is: %d\n", cmd.Process.Pid)
 
-	// 1. SETUP CGROUPS (Child is currently paused waiting for us)
+	// SETUP CGROUPS (Child is currently paused waiting for parents signal)
 	cg(cmd.Process.Pid)
 
-	// 2. SIGNAL CHILD TO RESUME
+	// Setup Host Networking
+	setupNetwork(cmd.Process.Pid)
+
+	// SIGNAL CHILD TO RESUME
 	// We write to the pipe. This unblocks the child.
 	fmt.Println("Parent: Cgroup set. Unpausing child...")
 	w.Write([]byte("OK"))
@@ -67,7 +70,8 @@ func run() {
 
 	// 3. CLEANUP ON EXIT
 	defer func() {
-		fmt.Println("\nParent: Cleaning up cgroups...")
+		fmt.Println("\nParent: Cleaning up cgroups and network...")
+		exec.Command("ip", "link", "delete", "veth0").Run()
 		removeCgroup()
 	}()
 
@@ -95,6 +99,13 @@ func child() {
 
 	must(syscall.Sethostname([]byte("container")))
 
+	// Bring up the loopback interface
+	must(exec.Command("ip", "link", "set", "lo", "up").Run())
+	// Assign an IP to child end of the veth cable
+	must(exec.Command("ip", "addr", "add", "192.168.100.2/24", "dev", "veth1").Run())
+	must(exec.Command("ip", "link", "set", "veth1", "up").Run())
+	// Route all outside traffic through the host's IP
+	must(exec.Command("ip", "route", "add", "default", "via", "192.168.100.1").Run())
 	// SETUP ROOT FS
 	newRoot := "/home/rupam/Projects/Rocker/rootfs"
 
@@ -161,6 +172,17 @@ func cg(pid int) {
 	if err := os.WriteFile(filepath.Join(myGroup, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0700); err != nil {
 		panic(fmt.Sprintf("Failed to add process to cgroup: %v", err))
 	}
+}
+
+func setupNetwork(pid int) {
+	fmt.Println("Parent: Configuring veth pair.....")
+	// Create veth pair (veth0 and veth1)
+	must(exec.Command("ip", "link", "add", "veth0", "type", "veth", "peer", "name", "veth1").Run())
+	// Assign IP to the host side (veth0) and bring it up
+	must(exec.Command("ip", "addr", "add", "192.168.100.1/24", "dev", "veth0").Run())
+	must(exec.Command("ip", "link", "set", "veth0", "up").Run())
+	// Move veth1 into child's network namespace
+	must(exec.Command("ip", "link", "set", "veth1", "netns", strconv.Itoa(pid)).Run())
 }
 
 func removeCgroup() {
