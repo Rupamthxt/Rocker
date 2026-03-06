@@ -107,7 +107,7 @@ func child() {
 	// Route all outside traffic through the host's IP
 	must(exec.Command("ip", "route", "add", "default", "via", "192.168.100.1").Run())
 	// SETUP ROOT FS
-	newRoot := "/home/rupam/Projects/Rocker/rootfs"
+	newRoot := "rootfs"
 
 	if _, err := os.Stat(newRoot); os.IsNotExist(err) {
 		fmt.Printf("\n[FATAL] The folder %s is missing!\n", newRoot)
