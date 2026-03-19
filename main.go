@@ -164,8 +164,12 @@ func cg(pid int) {
 	}
 
 	// LIMIT: 10 Processes
-	if err := os.WriteFile(filepath.Join(myGroup, "pids.max"), []byte("100"), 0700); err != nil {
+	if err := os.WriteFile(filepath.Join(myGroup, "pids.max"), []byte("20"), 0700); err != nil {
 		fmt.Printf("Warning: Could not set pids.max: %v\n", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(myGroup, "memory.max"), []byte("100M"), 0700); err != nil {
+		fmt.Printf("Warning: Could not set memory.max: %v\n", err)
 	}
 
 	// Add process
