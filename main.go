@@ -120,8 +120,25 @@ func child() {
 	// source="", target="/", fstype="", flags=MS_PRIVATE|MS_REC
 	must(syscall.Mount("", "/", "", syscall.MS_PRIVATE|syscall.MS_REC, ""))
 
-	// MMount newRoot to itself so that it becomes a distinct mount point.
+	// Mount newRoot to itself so that it becomes a distinct mount point.
 	must(syscall.Mount(newRoot, newRoot, "bind", syscall.MS_BIND|syscall.MS_REC, ""))
+
+	// 1. Define the Host path (where data actually lives on your machine)
+	hostVol := "/home/rupam/Projects/Rocker/vectradb_data"
+
+	// 2. Define the Container path
+	// CRITICAL: We must mount this into the `mergedDir` BEFORE we pivot_root!
+	containerVol := filepath.Join(newRoot, "app", "data")
+
+	// 3. Ensure both directories physically exist before mounting
+	// We use 0777 here just to avoid any immediate permission fighting between
+	// the host user and the container's root user.
+	must(os.MkdirAll(hostVol, 0777))
+	must(os.MkdirAll(containerVol, 0777))
+
+	// 4. The Magic Bind Mount
+	// This tells the kernel: "When the container writes to /app/data, actually write to hostVol"
+	must(syscall.Mount(hostVol, containerVol, "bind", syscall.MS_BIND|syscall.MS_REC, ""))
 
 	putOld := filepath.Join(newRoot, ".put_old")
 	if err := os.MkdirAll(putOld, 0700); err != nil {
