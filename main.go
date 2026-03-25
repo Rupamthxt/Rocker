@@ -28,8 +28,6 @@ func main() {
 func run() {
 	fmt.Printf("Parent: Starting container setup %v \n", os.Args[2:])
 
-	// --- Create a Pipe for Synchronization ---
-	// r = read end (passed to child), w = write end (kept by parent)
 	r, w, err := os.Pipe()
 	if err != nil {
 		panic(err)
@@ -37,8 +35,6 @@ func run() {
 
 	cmd := exec.Command("/proc/self/exe", append([]string{"child"}, os.Args[2:]...)...)
 
-	// Pass the Read-End of the pipe to the child as an "ExtraFile"
-	// It will show up as File Descriptor 3 (0=stdin, 1=stdout, 2=stderr, 3=pipe)
 	cmd.ExtraFiles = []*os.File{r}
 
 	cmd.Stdin = os.Stdin
@@ -58,9 +54,8 @@ func run() {
 
 	// SETUP CGROUPS (Child is currently paused waiting for parents signal)
 	cg(cmd.Process.Pid)
-
-	// Setup Host Networking
 	setupNetwork(cmd.Process.Pid)
+	setupPortForwarding()
 
 	// SIGNAL CHILD TO RESUME
 	// We write to the pipe. This unblocks the child.
@@ -68,11 +63,11 @@ func run() {
 	w.Write([]byte("OK"))
 	w.Close()
 
-	// 3. CLEANUP ON EXIT
 	defer func() {
 		fmt.Println("\nParent: Cleaning up cgroups and network...")
 		exec.Command("ip", "link", "delete", "veth0").Run()
 		removeCgroup()
+		removePortForwarding()
 	}()
 
 	if err := cmd.Wait(); err != nil {
@@ -81,14 +76,11 @@ func run() {
 }
 
 func child() {
-	// Wait for Parent Signal ---
-	// File Descriptor 3 is the pipe we passed in cmd.ExtraFiles
+
 	pipe := os.NewFile(3, "pipe")
 
 	fmt.Println("Child: Waiting for Cgroup setup...")
 
-	// This READ will block until the parent writes something.
-	// This ensures we don't start the shell until we are jailed.
 	_, err := io.ReadAll(pipe)
 	if err != nil {
 		panic(err)
@@ -99,14 +91,13 @@ func child() {
 
 	must(syscall.Sethostname([]byte("container")))
 
-	// Bring up the loopback interface
 	must(exec.Command("ip", "link", "set", "lo", "up").Run())
-	// Assign an IP to child end of the veth cable
+
 	must(exec.Command("ip", "addr", "add", "192.168.100.2/24", "dev", "veth1").Run())
 	must(exec.Command("ip", "link", "set", "veth1", "up").Run())
-	// Route all outside traffic through the host's IP
+
 	must(exec.Command("ip", "route", "add", "default", "via", "192.168.100.1").Run())
-	// SETUP ROOT FS
+
 	newRoot := "rootfs"
 
 	if _, err := os.Stat(newRoot); os.IsNotExist(err) {
@@ -115,30 +106,23 @@ func child() {
 		os.Exit(1)
 	}
 
-	// Make all mounts in this new namespace PRIVATE.
-	// This stops our mounts from leaking to the host and makes pivot_root happy.
-	// source="", target="/", fstype="", flags=MS_PRIVATE|MS_REC
 	must(syscall.Mount("", "/", "", syscall.MS_PRIVATE|syscall.MS_REC, ""))
 
-	// Mount newRoot to itself so that it becomes a distinct mount point.
 	must(syscall.Mount(newRoot, newRoot, "bind", syscall.MS_BIND|syscall.MS_REC, ""))
 
-	// 1. Define the Host path (where data actually lives on your machine)
-	hostVol := "/home/rupam/Projects/Rocker/vectradb_data"
+	hostVol, err := exec.Command("pwd").Output()
+	if err != nil {
+		panic(err)
+	}
 
-	// 2. Define the Container path
-	// CRITICAL: We must mount this into the `mergedDir` BEFORE we pivot_root!
+	host := filepath.Join(string(hostVol[:len(hostVol)-1]), "data")
+
 	containerVol := filepath.Join(newRoot, "app", "data")
 
-	// 3. Ensure both directories physically exist before mounting
-	// We use 0777 here just to avoid any immediate permission fighting between
-	// the host user and the container's root user.
-	must(os.MkdirAll(hostVol, 0777))
+	must(os.MkdirAll(host, 0777))
 	must(os.MkdirAll(containerVol, 0777))
 
-	// 4. The Magic Bind Mount
-	// This tells the kernel: "When the container writes to /app/data, actually write to hostVol"
-	must(syscall.Mount(hostVol, containerVol, "bind", syscall.MS_BIND|syscall.MS_REC, ""))
+	must(syscall.Mount(host, containerVol, "bind", syscall.MS_BIND|syscall.MS_REC, ""))
 
 	putOld := filepath.Join(newRoot, ".put_old")
 	if err := os.MkdirAll(putOld, 0700); err != nil {
@@ -204,6 +188,22 @@ func setupNetwork(pid int) {
 	must(exec.Command("ip", "link", "set", "veth0", "up").Run())
 	// Move veth1 into child's network namespace
 	must(exec.Command("ip", "link", "set", "veth1", "netns", strconv.Itoa(pid)).Run())
+}
+
+func setupPortForwarding() {
+	fmt.Println("Parent: Setting up Port Forwarding (Host:8080 -> Container:8080)...")
+
+	// Inbound traffic
+	must(exec.Command("iptables", "-t", "nat", "-A", "PREROUTING", "-p", "tcp", "--dport", "8080", "-j", "DNAT", "--to-destination", "192.168.100.2:8080").Run())
+
+	// Outbound traffic
+	must(exec.Command("iptables", "-t", "nat", "-A", "OUTPUT", "-p", "tcp", "--dport", "8080", "-j", "DNAT", "--to-destination", "192.168.100.2:8080").Run())
+}
+
+func removePortForwarding() {
+	// Cleanup
+	exec.Command("iptables", "-t", "nat", "-D", "PREROUTING", "-p", "tcp", "--dport", "8080", "-j", "DNAT", "--to-destination", "192.168.100.2:8080").Run()
+	exec.Command("iptables", "-t", "nat", "-D", "OUTPUT", "-p", "tcp", "--dport", "8080", "-j", "DNAT", "--to-destination", "192.168.100.2:8080").Run()
 }
 
 func removeCgroup() {
