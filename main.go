@@ -7,7 +7,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"rocker/helpers"
-	"strconv"
 	"syscall"
 )
 
@@ -56,9 +55,9 @@ func run() {
 	fmt.Printf("DEBUG: Child Host PID is: %d\n", cmd.Process.Pid)
 
 	// SETUP CGROUPS (Child is currently paused waiting for parents signal)
-	cg(cmd.Process.Pid)
-	setupNetwork(cmd.Process.Pid)
-	setupPortForwarding()
+	helpers.Cg(cmd.Process.Pid)
+	helpers.SetupNetwork(cmd.Process.Pid)
+	helpers.SetupPortForwarding()
 
 	// SIGNAL CHILD TO RESUME
 	// We write to the pipe. This unblocks the child.
@@ -69,8 +68,8 @@ func run() {
 	defer func() {
 		fmt.Println("\nParent: Cleaning up cgroups and network...")
 		exec.Command("ip", "link", "delete", "veth0").Run()
-		removeCgroup()
-		removePortForwarding()
+		helpers.RemoveCgroup()
+		helpers.RemovePortForwarding()
 	}()
 
 	if err := cmd.Wait(); err != nil {
@@ -157,60 +156,6 @@ func child() {
 	if err := cmd.Run(); err != nil {
 		os.Exit(1)
 	}
-}
-
-func cg(pid int) {
-	cgroups := "/sys/fs/cgroup"
-	myGroup := filepath.Join(cgroups, "rocker")
-
-	if err := os.Mkdir(myGroup, 0755); err != nil && !os.IsExist(err) {
-		panic(err)
-	}
-
-	// LIMIT: 10 Processes
-	if err := os.WriteFile(filepath.Join(myGroup, "pids.max"), []byte("20"), 0700); err != nil {
-		fmt.Printf("Warning: Could not set pids.max: %v\n", err)
-	}
-
-	if err := os.WriteFile(filepath.Join(myGroup, "memory.max"), []byte("100M"), 0700); err != nil {
-		fmt.Printf("Warning: Could not set memory.max: %v\n", err)
-	}
-
-	// Add process
-	if err := os.WriteFile(filepath.Join(myGroup, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0700); err != nil {
-		panic(fmt.Sprintf("Failed to add process to cgroup: %v", err))
-	}
-}
-
-func setupNetwork(pid int) {
-	fmt.Println("Parent: Configuring veth pair.....")
-	// Create veth pair (veth0 and veth1)
-	must(exec.Command("ip", "link", "add", "veth0", "type", "veth", "peer", "name", "veth1").Run())
-	// Assign IP to the host side (veth0) and bring it up
-	must(exec.Command("ip", "addr", "add", "192.168.100.1/24", "dev", "veth0").Run())
-	must(exec.Command("ip", "link", "set", "veth0", "up").Run())
-	// Move veth1 into child's network namespace
-	must(exec.Command("ip", "link", "set", "veth1", "netns", strconv.Itoa(pid)).Run())
-}
-
-func setupPortForwarding() {
-	fmt.Println("Parent: Setting up Port Forwarding (Host:8080 -> Container:8080)...")
-
-	// Inbound traffic
-	must(exec.Command("iptables", "-t", "nat", "-A", "PREROUTING", "-p", "tcp", "--dport", "8080", "-j", "DNAT", "--to-destination", "192.168.100.2:8080").Run())
-
-	// Outbound traffic
-	must(exec.Command("iptables", "-t", "nat", "-A", "OUTPUT", "-p", "tcp", "--dport", "8080", "-j", "DNAT", "--to-destination", "192.168.100.2:8080").Run())
-}
-
-func removePortForwarding() {
-	// Cleanup
-	exec.Command("iptables", "-t", "nat", "-D", "PREROUTING", "-p", "tcp", "--dport", "8080", "-j", "DNAT", "--to-destination", "192.168.100.2:8080").Run()
-	exec.Command("iptables", "-t", "nat", "-D", "OUTPUT", "-p", "tcp", "--dport", "8080", "-j", "DNAT", "--to-destination", "192.168.100.2:8080").Run()
-}
-
-func removeCgroup() {
-	os.Remove("/sys/fs/cgroup/rocker")
 }
 
 func must(err error) {

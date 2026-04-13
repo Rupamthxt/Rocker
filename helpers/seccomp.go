@@ -11,12 +11,15 @@ func ApplySeccomp() {
 	const PR_SET_SECCOMP = 22
 	const SECCOMP_MODE_FILTER = 2
 
+	// For demonstration using mkdir as a simple example.
 	var filter = []syscall.SockFilter{
 		{Code: 0x20, Jt: 0, Jf: 0, K: 0},
 		{Code: 0x15, Jt: 0, Jf: 1, K: 83},
 		{Code: 0x06, Jt: 0, Jf: 0, K: 0x00050001},
 		{Code: 0x06, Jt: 0, Jf: 0, K: 0x7FFF0000},
 	}
+
+	// TODO: Add more dangerous syscalls such as reboot, kexec_load, etc.
 
 	prog := &syscall.SockFprog{
 		Len:    uint16(len(filter)),
