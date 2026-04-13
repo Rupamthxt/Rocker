@@ -6,7 +6,7 @@ import (
 	"unsafe"
 )
 
-func applySeccomp() {
+func ApplySeccomp() {
 	const PR_SET_NO_NEW_PRIVS = 38
 	const PR_SET_SECCOMP = 22
 	const SECCOMP_MODE_FILTER = 2
